@@ -1,0 +1,12 @@
+# Tested with Python 3.13, torch 2.15, transformers 5.22, scikit-learn 1.9, matplotlib 3.11.
+torch>=2.4
+transformers>=4.56
+sentence-transformers>=3.0
+huggingface_hub
+scikit-learn>=1.5
+scipy
+numpy
+pandas>=2.0
+joblib
+matplotlib>=3.10
+pytest

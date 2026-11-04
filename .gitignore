@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+# model outputs and activations (large); regenerate with scripts/run_all.sh
+runs/
