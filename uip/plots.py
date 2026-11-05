@@ -127,8 +127,8 @@ def fig_behavior(res: Path, out: Path, theme: str) -> None:
     ax.set_yticks(range(len(rows)), [PAYLOAD_LABELS[r] for r in rows])
     ax2.set_xticks([0], ["asked by\nthe user"])
     ax2.set_yticks([])
-    ax.set_title("How often the model obeys the payload", pad=10)
-    ax.text(0, 1.015, "Rows: what the payload asks for. Columns: how it is framed inside the document (injected) "
+    ax.set_title("How often the model obeys the payload", pad=24)
+    ax.text(0, 1.02, "Rows: what the payload asks for. Columns: how it is framed inside the document (injected), "
             "or the same request made by the user.", transform=ax.transAxes, fontsize=7.5, color=t["ink2"], va="bottom")
     save(fig, out, "behavior", theme)
 
@@ -147,26 +147,24 @@ def fig_layer_sweep(res: Path, out: Path, theme: str) -> None:
         d = sweep[(sweep["probe"] == "lr") & (sweep["position"] == pos)].sort_values("layer")
         for k, (col, label) in enumerate(lines):
             ax.plot(d["layer"], d[col], color=t["series"][k], lw=2, solid_capstyle="round", label=label)
-        box = {"boxstyle": "round,pad=0.2", "fc": t["surface"], "ec": "none", "alpha": 0.9}
         ref_val = main.loc[ref, "auroc_mean"]
-        ax.axhline(ref_val, color=t["muted"], lw=1, zorder=1)
-        ax.text(0.98, ref_val, f"{METHOD_LABELS[ref]}: {ref_val:.2f}", transform=ax.get_yaxis_transform(),
-                ha="right", va="center", fontsize=7.5, color=t["ink2"], bbox=box, zorder=4)
+        ax.axhline(ref_val, color=t["muted"], lw=1, zorder=1, label="text-only TF-IDF baseline, all negatives")
         best = summary["best_layers"][pos]
         bv = d.set_index("layer").loc[best, "auroc"]
         ax.scatter([best], [bv], s=48, color=t["series"][0], edgecolor=t["surface"], linewidth=2, zorder=5)
-        ax.annotate(f"best: layer {best}, {bv:.3f}", (best, bv), xytext=(-8, 10), textcoords="offset points",
-                    ha="right", fontsize=7.5, color=t["ink2"], bbox=box, zorder=6)
         ax.axhline(0.5, color=t["axis"], lw=0.8)
-        ax.set_title(title)
+        ax.set_title(title, pad=20)
+        ax.text(0, 1.02, f"best layer {best}: AUROC {bv:.3f}  ·  {METHOD_LABELS[ref]}: {ref_val:.3f}",
+                transform=ax.transAxes, fontsize=7.5, color=t["ink2"], va="bottom")
         ax.set_xlabel("layer (0 = embeddings)")
         ax.set_xlim(-0.5, d["layer"].max() + 0.5)
     lo = sweep.loc[sweep["probe"] == "lr", [c for c, _ in lines]].min().min()
     axes[0].set_ylim(min(0.45, np.floor(lo * 20) / 20 - 0.02), 1.02)
     axes[0].set_ylabel("AUROC (5-fold CV, grouped by document)")
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, [f"positives {lab}" if lab.startswith("vs") else f"positives vs. {lab}" for lab in labels],
-               loc="upper left", ncol=3, bbox_to_anchor=(0.06, 1.07), fontsize=8.5)
+    labels = [lab if lab.startswith("text-only") else
+              (f"positives {lab}" if lab.startswith("vs") else f"positives vs. {lab}") for lab in labels]
+    fig.legend(handles, labels, loc="upper left", ncol=2, bbox_to_anchor=(0.06, 1.13), fontsize=8.5)
     save(fig, out, "layer_sweep", theme)
 
 

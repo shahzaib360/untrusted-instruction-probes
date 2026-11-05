@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import pickle
 import time
 import warnings
 from pathlib import Path
@@ -51,7 +52,7 @@ from uip.labels import GROUPS, NEGATIVE_GROUPS, load_activations, load_labeled
 
 SEED = 0
 N_FOLDS = 5
-DENSE_CS = [1e-4, 1e-3, 1e-2, 1e-1, 1.0]
+DENSE_CS = [1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0]
 SPARSE_CS = [0.01, 0.1, 1.0, 10.0, 100.0]
 
 METHOD_LABELS = {
@@ -185,12 +186,65 @@ def score_method(method: str, inputs, y: np.ndarray, tr: np.ndarray, te: np.ndar
     raise ValueError(method)
 
 
-def score_many(exp: Experiment, jobs: list[tuple[str, np.ndarray, np.ndarray]], layers: dict[str, int],
-               n_jobs: int, y: np.ndarray | None = None) -> list[np.ndarray]:
-    """Score (method, train_idx, test_idx) jobs in parallel."""
+class OutOfTime(Exception):
+    """Raised when the --budget-min wall-clock budget is used up (rerun to resume)."""
+
+
+class JobRunner:
+    """Runs jobs in parallel batches and caches each result on disk.
+
+    Each job is ``(key, func, make_args)``; ``make_args`` is called lazily so large
+    inputs are only built for the batch being run. Finished jobs are skipped on the
+    next invocation, so an interrupted evaluation resumes where it stopped.
+    """
+
+    def __init__(self, cache_dir: Path, n_jobs: int, deadline: float | None):
+        self.cache_dir, self.n_jobs, self.deadline = cache_dir, n_jobs, deadline
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _path(self, key: str) -> Path:
+        return self.cache_dir / f"{key}.pkl"
+
+    def run(self, jobs: list[tuple[str, object, object]]) -> dict[str, object]:
+        todo = [j for j in jobs if not self._path(j[0]).exists()]
+        step = max(1, 2 * self.n_jobs)
+        with Parallel(n_jobs=self.n_jobs) as par:
+            for i in range(0, len(todo), step):
+                if self.deadline is not None and time.time() > self.deadline:
+                    raise OutOfTime()
+                batch = todo[i : i + step]
+                results = par(delayed(func)(*make_args()) for _, func, make_args in batch)
+                for (key, _, _), r in zip(batch, results):
+                    with open(self._path(key), "wb") as fh:
+                        pickle.dump(r, fh)
+        out = {}
+        for key, _, _ in jobs:
+            with open(self._path(key), "rb") as fh:
+                out[key] = pickle.load(fh)
+        return out
+
+
+def method_key(method: str, layers: dict[str, int]) -> str:
+    if method.startswith(("probe_", "diffmean_")):
+        return f"{method}_L{layers[method.split('_')[1]]}"
+    return method
+
+
+def score_jobs(exp: Experiment, prefix: str, splits: list[tuple[str, np.ndarray, np.ndarray]],
+               methods: list[str], layers: dict[str, int], y: np.ndarray | None = None):
+    """Jobs scoring every method on every (split_name, train_idx, test_idx)."""
     y = exp.y if y is None else y
-    cache = {m: exp.inputs(m, layers) for m in {j[0] for j in jobs}}
-    return Parallel(n_jobs=n_jobs)(delayed(score_method)(m, cache[m], y, tr, te) for m, tr, te in jobs)
+    inputs: dict[str, object] = {}
+
+    def args_for(m, tr, te):
+        def make():
+            if m not in inputs:
+                inputs[m] = exp.inputs(m, layers)
+            return (m, inputs[m], y, tr, te)
+        return make
+
+    return [(f"{prefix}_{name}_{method_key(m, layers)}", score_method, args_for(m, tr, te))
+            for name, tr, te in splits for m in methods]
 
 
 def _sweep_one(X: np.ndarray, y: np.ndarray, groups: np.ndarray, folds, kind: str) -> dict:
@@ -206,14 +260,17 @@ def _sweep_one(X: np.ndarray, y: np.ndarray, groups: np.ndarray, folds, kind: st
     return pd.DataFrame(per_fold).mean(numeric_only=True).to_dict()
 
 
-def layer_sweep(exp: Experiment, folds, n_jobs: int) -> pd.DataFrame:
-    jobs = [(pos, layer, kind) for pos in ("prompt", "response") for kind in ("lr", "diffmean")
-            for layer in range(exp.n_layers)]
-    results = Parallel(n_jobs=n_jobs)(
-        delayed(_sweep_one)(np.ascontiguousarray(exp.acts[pos][:, layer, :]), exp.y, exp.groups, folds, kind)
-        for pos, layer, kind in jobs
-    )
-    rows = [{"position": pos, "layer": layer, "probe": kind, **r} for (pos, layer, kind), r in zip(jobs, results)]
+def layer_sweep(exp: Experiment, folds, runner: JobRunner) -> pd.DataFrame:
+    specs = [(pos, layer, kind) for pos in ("prompt", "response") for kind in ("lr", "diffmean")
+             for layer in range(exp.n_layers)]
+
+    def make(pos, layer, kind):
+        return lambda: (np.ascontiguousarray(exp.acts[pos][:, layer, :]), exp.y, exp.groups, folds, kind)
+
+    jobs = [(f"sweep_{pos}_{layer:02d}_{kind}", _sweep_one, make(pos, layer, kind)) for pos, layer, kind in specs]
+    res = runner.run(jobs)
+    rows = [{"position": pos, "layer": layer, "probe": kind, **res[key]}
+            for (pos, layer, kind), (key, _, _) in zip(specs, jobs)]
     return pd.DataFrame(rows)
 
 
@@ -288,10 +345,24 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     ap.add_argument("--n-jobs", type=int, default=4)
     ap.add_argument("--skip-generalization", action="store_true")
+    ap.add_argument("--cache-dir", default=None, help="per-job result cache (default: <run-dir>/eval_cache)")
+    ap.add_argument("--budget-min", type=float, default=None,
+                    help="stop cleanly (exit code 3) after this many minutes; rerun to resume from the cache")
     args = ap.parse_args()
+    try:
+        evaluate(args)
+    except OutOfTime:
+        print("INCOMPLETE: time budget used up; rerun the same command to resume", flush=True)
+        raise SystemExit(3)
+
+
+def evaluate(args) -> None:
     t0 = time.time()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    cache_dir = Path(args.cache_dir) if args.cache_dir else Path(args.run_dir) / "eval_cache"
+    deadline = t0 + 60 * args.budget_min if args.budget_min else None
+    runner = JobRunner(cache_dir, args.n_jobs, deadline)
 
     df_all = load_labeled(args.run_dir, args.prompts, keep_ambiguous=True)
     df = df_all[df_all["group"].notna()].reset_index(drop=True)
@@ -319,7 +390,7 @@ def main() -> None:
 
     # ---- 1. layer sweep
     folds = exp.cv_folds()
-    sweep = layer_sweep(exp, folds, args.n_jobs)
+    sweep = layer_sweep(exp, folds, runner)
     sweep.to_csv(out / "layer_sweep.csv", index=False)
     lr = sweep[sweep["probe"] == "lr"]
     layers = {pos: int(lr[lr["position"] == pos].sort_values("auroc", ascending=False)["layer"].iloc[0])
@@ -331,12 +402,14 @@ def main() -> None:
     oof = {m: np.zeros(len(df)) for m in methods}
     fold_rows = []
     fold_of = np.zeros(len(df), dtype=int)
-    jobs = [(m, tr, te) for tr, te in folds for m in methods]
-    job_fold = [k for k in range(len(folds)) for _ in methods]
-    for (m, tr, te), k, s in zip(jobs, job_fold, score_many(exp, jobs, layers, args.n_jobs)):
+    fold_splits = [(f"fold{k}", tr, te) for k, (tr, te) in enumerate(folds)]
+    scores = runner.run(score_jobs(exp, "main", fold_splits, methods, layers))
+    for k, (tr, te) in enumerate(folds):
         fold_of[te] = k
-        oof[m][te] = s
-        fold_rows.append({"method": m, "fold": k, **metrics(exp.y[te], s, exp.groups[te])})
+        for m in methods:
+            s = scores[f"main_fold{k}_{method_key(m, layers)}"]
+            oof[m][te] = s
+            fold_rows.append({"method": m, "fold": k, **metrics(exp.y[te], s, exp.groups[te])})
     folds_df = pd.DataFrame(fold_rows)
     folds_df.to_csv(out / "main_per_fold.csv", index=False)
     main_tbl = folds_df.drop(columns="fold").groupby("method", sort=False).agg(["mean", "std"])
@@ -354,9 +427,10 @@ def main() -> None:
 
     # Same folds, secondary target: is an injection present at all (followed or not)?
     y_inj = df["y_injected"].to_numpy()
-    jobs = [(m, tr, te) for tr, te in folds for m in ("probe_prompt", "tfidf_prompt", "embed_prompt", "protectai_document")]
-    inj_rows = [{"method": m, "auroc": _auc(y_inj[te], s)}
-                for (m, tr, te), s in zip(jobs, score_many(exp, jobs, layers, args.n_jobs, y=y_inj))]
+    presence_methods = ["probe_prompt", "tfidf_prompt", "embed_prompt", "protectai_document"]
+    scores = runner.run(score_jobs(exp, "presence", fold_splits, presence_methods, layers, y=y_inj))
+    inj_rows = [{"method": m, "auroc": _auc(y_inj[te], scores[f"presence_fold{k}_{method_key(m, layers)}"])}
+                for k, (tr, te) in enumerate(folds) for m in presence_methods]
     inj_tbl = pd.DataFrame(inj_rows).groupby("method", sort=False)["auroc"].agg(["mean", "std"]).reset_index()
     inj_tbl.to_csv(out / "injection_presence.csv", index=False)
     print(f"[{(time.time() - t0) / 60:.1f} min] main comparison done", flush=True)
@@ -364,13 +438,14 @@ def main() -> None:
     # ---- 3. generalization
     if not args.skip_generalization:
         splits = list(generalization_splits(df))
-        jobs = [(m, tr, te) for _, _, tr, te in splits for m in methods]
-        scores = score_many(exp, jobs, layers, args.n_jobs)
+        named = [(f"{split_type}-{held}", tr, te) for split_type, held, tr, te in splits]
+        scores = runner.run(score_jobs(exp, "gen", named, methods, layers))
         gen_rows = []
-        for i, (m, tr, te) in enumerate(jobs):
-            split_type, held = splits[i // len(methods)][:2]
-            gen_rows.append({"split": split_type, "held_out": held, "method": m,
-                             **metrics(exp.y[te], scores[i], exp.groups[te])})
+        for (split_type, held, tr, te), (name, _, _) in zip(splits, named):
+            for m in methods:
+                s = scores[f"gen_{name}_{method_key(m, layers)}"]
+                gen_rows.append({"split": split_type, "held_out": held, "method": m,
+                                 **metrics(exp.y[te], s, exp.groups[te])})
         pd.DataFrame(gen_rows).to_csv(out / "generalization.csv", index=False)
         print(f"[{(time.time() - t0) / 60:.1f} min] generalization done", flush=True)
 
@@ -384,7 +459,6 @@ def main() -> None:
         "best_layers": layers,
         "n_layers_plus_embeddings": exp.n_layers,
         "folds": N_FOLDS,
-        "minutes": round((time.time() - t0) / 60, 1),
     }
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2))
