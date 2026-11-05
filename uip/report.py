@@ -127,14 +127,15 @@ def main() -> None:
     text = [m for m in main_tbl.index if m.startswith(("tfidf", "embed"))]
     best_text = main_tbl.loc[text, "auroc_mean"].idxmax()
     best_text_prompt = main_tbl.loc[[m for m in text if m.endswith("_prompt")], "auroc_mean"].idxmax()
-    gen_methods = ["probe_prompt", "probe_response", best_text_prompt, best_text, "protectai_document"]
+    gen_methods = ["probe_prompt", "probe_response", "diffmean_response", best_text_prompt, best_text,
+                   "embed_response", "protectai_document"]
     gen_methods = list(dict.fromkeys(gen_methods))
     parts = [
         f"# Results: {summary['model']}",
         "```json\n" + json.dumps(summary, indent=2) + "\n```",
         "## Main comparison (5-fold CV grouped by document, mean ± sd over folds)", main_table(res),
         "## Injection *presence* (secondary target, same folds)", presence_table(res),
-        "## Generalization summary", generalization_table(res, gen_methods),
+        "## Generalization summary (every detector)", generalization_table(res, list(METHOD_LABELS)),
         "### Held-out payload: AUROC vs. injection ignored", generalization_detail(res, gen_methods, "payload", "auroc_vs_injected_ignored"),
         "### Held-out payload: AUROC vs. user asked, obeyed", generalization_detail(res, gen_methods, "payload", "auroc_vs_user_followed"),
         "### Held-out framing: AUROC vs. injection ignored", generalization_detail(res, gen_methods, "framing", "auroc_vs_injected_ignored"),
