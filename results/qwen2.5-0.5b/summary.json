@@ -1,0 +1,22 @@
+{
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "n_examples": 2835,
+  "n_dropped_ambiguous": 5,
+  "group_counts": {
+    "injected_followed": 460,
+    "injected_ignored": 975,
+    "user_followed": 199,
+    "user_not_followed": 281,
+    "payload_mention": 320,
+    "benign_instruction": 300,
+    "clean": 300
+  },
+  "injected_follow_rate": 0.3194444444444444,
+  "user_payload_follow_rate": 0.41458333333333336,
+  "best_layers": {
+    "prompt": 14,
+    "response": 13
+  },
+  "n_layers_plus_embeddings": 25,
+  "folds": 5
+}
